@@ -1,56 +1,38 @@
 # TimelyStandup AI Microservice
 
-This standalone microservice provides AI processing capabilities for the TimelyStandup platform. It exposes HTTP endpoints for analyzing standup videos, clarifying text questions, and summarizing developer responses.
+This microservice provides specialized processing capabilities for the TimelyStandup platform. It handles media extraction and leverages Large Language Models to generate actionable summaries from developer standup data.
 
-## Prerequisites
+## 🏗 Architecture
 
-- Python 3.12+
-- FFmpeg (for video processing)
-- Docker (optional)
+Designed as an independent, stateless FastAPI application. It is meant to be called by the `timelystandup-core` worker or other workflow engines over HTTP. 
+By isolating these heavyweight AI and FFmpeg tasks, the Core API remains responsive.
+- **Media Processing:** Uses FFmpeg to extract audio from video files.
+- **AI Integration:** Interfaces with the Gemini AI APIs (and easily extensible to other providers) to transcribe and summarize text and media.
 
-## Configuration
+## 🛠 Tech Stack
+- **Framework:** FastAPI
+- **LLM SDK:** Google GenAI (Gemini)
+- **Media Tools:** FFmpeg
+- **HTTP Client:** HTTPX
 
-Copy `.env.example` to `.env` and fill in the required values:
+## 🚀 Setup Instructions
 
-```bash
-cp .env.example .env
-```
-
-Ensure `GEMINI_API_KEY` is set.
-
-## Running Standalone Locally
-
-1. Create a virtual environment and install dependencies:
+1. **System Requirements:**
+   You must have `ffmpeg` installed on your host system if running outside of Docker.
+2. **Environment Configuration:**
+   Copy `.env.example` to `.env` and fill in the required values (importantly `GEMINI_API_KEY`).
+   ```bash
+   cp .env.example .env
+   ```
+3. **Local Virtual Environment:**
    ```bash
    python -m venv venv
    source venv/bin/activate
    pip install -r requirements.txt
    ```
-2. Start the service:
+4. **Start the Service:**
    ```bash
    uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
    ```
-
-## Running with Docker
-
-Build the image and run the container:
-```bash
-docker build -t timelystandup-ai .
-docker run -p 8001:8001 --env-file .env timelystandup-ai
-```
-
-## Running with Docker Compose
-
-This service is typically run alongside `timelystandup-core` and the infrastructure services via a docker-compose setup. The AI service will be configured as a standard dependency.
-
-## API Documentation
-
-When the service is running, interactive API documentation is available at `http://localhost:8001/docs`.
-
-### Example Request
-
-```bash
-curl -X POST http://localhost:8001/ai/text/clarify \
-  -H "Content-Type: application/json" \
-  -d '{"raw_questions": "What did you do today?"}'
-```
+5. **Interactive Docs:**
+   Access the Swagger UI at `http://localhost:8001/docs` to test endpoints like `/ai/text/clarify`.
