@@ -82,6 +82,7 @@ class GeminiProvider(BaseAIProvider):
         contents: list[Any] = []
         uploaded_file = None
 
+        is_temp_file = False
         if video_url:
             if "youtube.com" in video_url or "youtu.be" in video_url:
                 # Note: Gemini 1.5+ can sometimes process YouTube URLs natively if passed as a string
@@ -98,6 +99,7 @@ class GeminiProvider(BaseAIProvider):
                             async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                                 await f.write(chunk)
                         video_path = Path(tmp_name)
+                        is_temp_file = True
         
         if video_path:
             # Always use File API for files to avoid base64 bloat and support large files
@@ -149,6 +151,8 @@ class GeminiProvider(BaseAIProvider):
             # Clean up Gemini File API resource to save space
             if uploaded_file:
                 await self._client.aio.files.delete(name=uploaded_file.name)
+            if is_temp_file and video_path:
+                video_path.unlink(missing_ok=True)
 
         latency = _now_ms() - start_ms
         raw_json = _extract_json(response.text)
