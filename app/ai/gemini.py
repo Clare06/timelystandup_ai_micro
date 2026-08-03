@@ -38,6 +38,8 @@ from app.ai.schemas import (
     VideoSummaryResponse,
 )
 from app.config import settings
+from app.services.video_compressor import compress_video
+from app.services.video_chunker import chunk_video
 
 logger = logging.getLogger(__name__)
 
@@ -102,24 +104,73 @@ class GeminiProvider(BaseAIProvider):
                         is_temp_file = True
         
         if video_path:
-            # Always use File API for files to avoid base64 bloat and support large files
-            logger.info(f"Uploading {video_path} to Gemini...")
-            uploaded_file = await self._client.aio.files.upload(file=str(video_path))
-            
-            # Videos require processing time on Google's servers
-            iterations = 0
-            while uploaded_file.state.name == "PROCESSING":
-                if iterations >= 150:
-                    raise TimeoutError(f"Video processing timed out after 5 minutes for {uploaded_file.name}")
-                logger.info(f"Waiting for video processing: {uploaded_file.name}")
-                await asyncio.sleep(2)
-                uploaded_file = await self._client.aio.files.get(name=uploaded_file.name)
-                iterations += 1
-                
-            if uploaded_file.state.name == "FAILED":
-                raise ValueError("Video processing failed on Google servers.")
-                
-            contents.append(uploaded_file)
+            # Compress first
+            compressed_path, was_compressed = await compress_video(video_path)
+            _compressed_to_clean = compressed_path if was_compressed else None
+
+            compressed_size_mb = compressed_path.stat().st_size / (1024 * 1024)
+
+            if compressed_size_mb > settings.chunk_threshold_mb:
+                # --- CHUNKED PATH ---
+                logger.info(f"[Pipeline] File {compressed_size_mb:.1f}MB > threshold. Chunking...")
+                chunks = await chunk_video(compressed_path)
+                try:
+                    # Upload all chunks to File API in parallel
+                    uploaded_chunks = await asyncio.gather(*[
+                        self._client.aio.files.upload(file=str(c)) for c in chunks
+                    ])
+                    # Wait for all to finish processing
+                    ready_chunks = []
+                    for uf in uploaded_chunks:
+                        iterations = 0
+                        while uf.state.name == "PROCESSING":
+                            if iterations >= 150:
+                                raise TimeoutError(f"Chunk timed out: {uf.name}")
+                            await asyncio.sleep(2)
+                            uf = await self._client.aio.files.get(name=uf.name)
+                            iterations += 1
+                        if uf.state.name == "FAILED":
+                            raise ValueError(f"Chunk processing failed: {uf.name}")
+                        ready_chunks.append(uf)
+                    
+                    roster_json = "[]" # TODO: Fetch from DB in future releases
+                    system_instruction = VIDEO_SYSTEM_PROMPT.replace("{{TEAM_ROSTER_JSON}}", roster_json)
+
+                    # Analyse each chunk in parallel
+                    chunk_results = await asyncio.gather(*[
+                        self._analyse_single_chunk(uf, system_instruction) for uf in ready_chunks
+                    ])
+
+                    # Merge summaries with cheap text model
+                    merged, merge_usage = await self._merge_chunk_summaries(chunk_results)
+                    return merged, AIUsageMetadata(
+                        model_used=settings.ai_model_video,
+                        task_type="video_summary_chunked",
+                        latency_ms=_now_ms() - start_ms,
+                    )
+                finally:
+                    # Cleanup chunks from File API and disk
+                    for uf in uploaded_chunks if 'uploaded_chunks' in locals() else []:
+                        try:
+                            await self._client.aio.files.delete(name=uf.name)
+                        except Exception:
+                            pass
+                    for c in chunks:
+                        c.unlink(missing_ok=True)
+            else:
+                # --- SINGLE FILE PATH (existing code) ---
+                logger.info(f"Uploading {compressed_path} to Gemini...")
+                uploaded_file = await self._client.aio.files.upload(file=str(compressed_path))
+                iterations = 0
+                while uploaded_file.state.name == "PROCESSING":
+                    if iterations >= 150:
+                        raise TimeoutError(f"Video processing timed out: {uploaded_file.name}")
+                    await asyncio.sleep(2)
+                    uploaded_file = await self._client.aio.files.get(name=uploaded_file.name)
+                    iterations += 1
+                if uploaded_file.state.name == "FAILED":
+                    raise ValueError("Video processing failed on Google servers.")
+                contents.append(uploaded_file)
         elif video_bytes:
             # Fallback for inline bytes (under 20MB)
             contents.append(
@@ -144,13 +195,17 @@ class GeminiProvider(BaseAIProvider):
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     response_mime_type="application/json",
-                    temperature=0.2,
+                    temperature=0.1,  # Low temp: deterministic sentiment/sarcasm extraction
                 ),
             )
         finally:
-            # Clean up Gemini File API resource to save space
-            if uploaded_file:
-                await self._client.aio.files.delete(name=uploaded_file.name)
+            if 'uploaded_file' in locals() and uploaded_file:
+                try:
+                    await self._client.aio.files.delete(name=uploaded_file.name)
+                except Exception:
+                    pass
+            if '_compressed_to_clean' in locals() and _compressed_to_clean:
+                _compressed_to_clean.unlink(missing_ok=True)
             if is_temp_file and video_path:
                 video_path.unlink(missing_ok=True)
 
@@ -166,6 +221,56 @@ class GeminiProvider(BaseAIProvider):
             latency_ms=latency,
         )
 
+        return parsed, usage
+
+    async def _analyse_single_chunk(
+        self, uploaded_file, system_instruction: str
+    ) -> str:
+        """Run video analysis on a single uploaded chunk. Returns raw summary string."""
+        response = await self._client.aio.models.generate_content(
+            model=settings.ai_model_video,
+            contents=[
+                uploaded_file,
+                "Analyse this standup video segment. Extract key points, sentiment, blockers, and mentions."
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                temperature=0.1,
+            ),
+        )
+        return response.text
+
+    async def _merge_chunk_summaries(
+        self, chunk_summaries: list[str]
+    ) -> tuple[VideoSummaryResponse, AIUsageMetadata]:
+        """Merge N chunk summaries into one unified VideoSummaryResponse."""
+        numbered = "\n\n".join(
+            f"=== Segment {i+1} ===\n{s}" for i, s in enumerate(chunk_summaries)
+        )
+        merge_prompt = (
+            "You are given partial JSON summaries from consecutive segments of a standup meeting. "
+            "Merge them into ONE unified JSON summary matching the same schema. "
+            "Preserve all action items, blockers, mentions, and sentiment. Remove duplicates.\n\n"
+            + numbered
+        )
+        response = await self._client.aio.models.generate_content(
+            model=settings.ai_model_text,
+            contents=merge_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+            ),
+        )
+        raw_json = _extract_json(response.text)
+        parsed = VideoSummaryResponse.model_validate(raw_json)
+        usage = AIUsageMetadata(
+            model_used=settings.ai_model_text,
+            task_type="chunk_merge",
+            prompt_tokens=getattr(response.usage_metadata, "prompt_token_count", None) if hasattr(response, "usage_metadata") else None,
+            response_tokens=getattr(response.usage_metadata, "candidates_token_count", None) if hasattr(response, "usage_metadata") else None,
+            latency_ms=0,
+        )
         return parsed, usage
 
     # ── Text Question Clarification ───────────
